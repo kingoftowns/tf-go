@@ -24,7 +24,6 @@ func main() {
 		varsFileFlag  = flag.String("vars-file", "", "Path to tfvars file")
 		actionFlag    = flag.String("action", "plan", "Terraform action (plan, apply, destroy)")
 		vaultAddrFlag = flag.String("vault-addr", "", "Vault server address")
-		debugFlag     = flag.Bool("debug", false, "Enable debug mode")
 	)
 
 	// Custom short flags
@@ -145,12 +144,21 @@ func main() {
 		}
 
 		// Print plan summary
-		if plan.PlannedValues != nil {
-			fmt.Printf("Plan: %d to add, %d to change, %d to destroy.\n",
-				len(plan.ResourceChanges.Add()),
-				len(plan.ResourceChanges.Update()),
-				len(plan.ResourceChanges.Destroy()),
-			)
+		if plan.ResourceChanges != nil {
+			var toAdd, toChange, toDestroy int
+			for _, rc := range plan.ResourceChanges {
+				if rc.Change != nil {
+					action := rc.Change.Actions
+					if action.Create() {
+						toAdd++
+					} else if action.Update() {
+						toChange++
+					} else if action.Delete() {
+						toDestroy++
+					}
+				}
+			}
+			fmt.Printf("Plan: %d to add, %d to change, %d to destroy.\n", toAdd, toChange, toDestroy)
 		}
 
 	case "apply":

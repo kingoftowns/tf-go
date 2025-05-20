@@ -1,6 +1,6 @@
 module github.com/kingoftowns/tf-go
 
-go 1.23.4
+go 1.21.7
 
 require (
 	github.com/hashicorp/terraform-exec v0.19.0
