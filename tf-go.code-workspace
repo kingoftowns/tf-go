@@ -1,0 +1,27 @@
+{
+    "folders": [
+        {
+            "path": "."
+        }
+    ],
+    "settings": {
+        "go.useLanguageServer": true,
+        "go.lintTool": "golangci-lint",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.organizeImports": "explicit"
+        },
+        "files.exclude": {
+            "**/.git": true,
+            "**/.DS_Store": true,
+            "**/go.sum": false
+        }
+    },
+    "extensions": {
+        "recommendations": [
+            "golang.go",
+            "ms-azuretools.vscode-docker",
+            "hashicorp.terraform"
+        ]
+    }
+}
