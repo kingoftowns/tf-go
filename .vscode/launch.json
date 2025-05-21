@@ -1,0 +1,28 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Main",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/cmd/deploy/main.go",
+            "args": [
+                "--path",
+                "/path/to/terraform/code",
+                "--stack",
+                "",
+                "--env",
+                "dev",
+                "--action",
+                "plan",
+                "--vault-addr",
+                "https://vault.address/"
+            ],
+            "showLog": true,
+            "env": {
+                "VAULT_TOKEN": "hvs.your_vault_token"
+            }
+        }
+    ]
+}

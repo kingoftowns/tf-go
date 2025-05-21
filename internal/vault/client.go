@@ -1,4 +1,3 @@
-// internal/vault/client.go
 package vault
 
 import (
@@ -11,12 +10,10 @@ import (
 	"github.com/kingoftowns/tf-go/internal/config"
 )
 
-// Client is a wrapper around the Vault client
 type Client struct {
 	client *vaultapi.Client
 }
 
-// NewClient creates a new Vault client
 func NewClient(address string) (*Client, error) {
 	config := vaultapi.DefaultConfig()
 	if address != "" {
@@ -33,7 +30,6 @@ func NewClient(address string) (*Client, error) {
 	}, nil
 }
 
-// Authenticate authenticates with Vault using the configured method
 func (c *Client) Authenticate(ctx context.Context, cfg *config.Config) error {
 	switch cfg.Vault.AuthMethod {
 	case "token":
