@@ -62,29 +62,22 @@ type BackendConfig struct {
 
 // LoadConfig loads the global and environment-specific configuration
 func LoadConfig(env string) (*Config, error) {
-	// Get user's home directory
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get home directory: %w", err)
-	}
-
-	// Path to config files
-	configDir := filepath.Join(homeDir, ".terraform-deployer")
-	globalConfigPath := filepath.Join(configDir, "config.yaml")
-
 	// Load global config
 	cfg := &Config{
 		Environments: make(map[string]EnvironmentConfig),
 	}
 
-	// Set default configuration first
+	// Set default configuration
 	cfg.Defaults.Environment = "dev"
 	cfg.Defaults.VarsPathTemplate = "./tfvars/{{env}}/{{stack}}.tfvars"
 	cfg.Defaults.StackPathTemplate = "./app/stacks/{{stack}}"
-	cfg.Defaults.ProviderPathTemplate = "secret/terraform/providers/{{env}}"
+	cfg.Defaults.ProviderPathTemplate = "kv/data/terraform/providers"
 	cfg.Terraform.BackendType = "local"
+	cfg.Vault.Address = "http://127.0.0.1:8200"
+	cfg.Vault.AuthMethod = "token"
 
-	// If config file exists, load it
+	// Look for optional project-local config files
+	globalConfigPath := "./config.yaml"
 	if _, err := os.Stat(globalConfigPath); err == nil {
 		data, err := os.ReadFile(globalConfigPath)
 		if err != nil {
@@ -94,26 +87,10 @@ func LoadConfig(env string) (*Config, error) {
 		if err := yaml.Unmarshal(data, cfg); err != nil {
 			return nil, fmt.Errorf("failed to parse config file: %w", err)
 		}
-	} else {
-		// Create default config file if it doesn't exist
-		if os.IsNotExist(err) {
-			os.MkdirAll(configDir, 0755)
-			cfg.Vault.Address = "http://127.0.0.1:8200"
-			cfg.Vault.AuthMethod = "token"
-
-			data, err := yaml.Marshal(cfg)
-			if err != nil {
-				return nil, fmt.Errorf("failed to marshal default config: %w", err)
-			}
-
-			if err := os.WriteFile(globalConfigPath, data, 0644); err != nil {
-				return nil, fmt.Errorf("failed to write default config: %w", err)
-			}
-		}
 	}
 
 	// Load environment-specific config if available
-	envConfigPath := filepath.Join(configDir, "environments", env+".yaml")
+	envConfigPath := filepath.Join("./environments", env+".yaml")
 	if _, err := os.Stat(envConfigPath); err == nil {
 		data, err := os.ReadFile(envConfigPath)
 		if err != nil {

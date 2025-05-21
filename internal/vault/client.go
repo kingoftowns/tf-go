@@ -2,13 +2,24 @@ package vault
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 
 	vaultapi "github.com/hashicorp/vault/api"
 	"github.com/kingoftowns/tf-go/internal/config"
 )
+
+func getKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
 
 type Client struct {
 	client *vaultapi.Client
@@ -35,6 +46,7 @@ func (c *Client) Authenticate(ctx context.Context, cfg *config.Config) error {
 	case "token":
 		// Try to get token from environment variable first
 		token := os.Getenv("VAULT_TOKEN")
+		fmt.Printf("DEBUG: Token from env: %s\n", token)
 		if token == "" {
 			// Fallback to reading from token file
 			homeDir, err := os.UserHomeDir()
@@ -57,6 +69,7 @@ func (c *Client) Authenticate(ctx context.Context, cfg *config.Config) error {
 		}
 
 		c.client.SetToken(token)
+		fmt.Printf("DEBUG: Token authentication successful\n")
 		return nil
 
 	case "approle":
@@ -93,16 +106,86 @@ func (c *Client) Authenticate(ctx context.Context, cfg *config.Config) error {
 	}
 }
 
-// GetProviderConfig retrieves provider configuration from Vault
-func (c *Client) GetProviderConfig(ctx context.Context, path string) (map[string]interface{}, error) {
-	secret, err := c.client.Logical().Read(path)
+// GetProviderConfig retrieves provider configuration from Vault using direct HTTP
+func (c *Client) GetProviderConfig(ctx context.Context, path, env string) (map[string]interface{}, error) {
+	// Get vault address and build full URL
+	vaultAddr := os.Getenv("VAULT_ADDR")
+	if vaultAddr == "" {
+		vaultAddr = "http://127.0.0.1:8200"
+	}
+	
+	// Build full URL - add /v1/ prefix for Vault API
+	url := vaultAddr + "/v1/" + path
+	
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read from Vault: %w", err)
+		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
-
-	if secret == nil || secret.Data == nil {
-		return nil, fmt.Errorf("no data found at path: %s", path)
+	
+	// Add vault token header
+	token := os.Getenv("VAULT_TOKEN")
+	if token == "" {
+		return nil, fmt.Errorf("VAULT_TOKEN not set")
 	}
-
-	return secret.Data, nil
+	req.Header.Set("X-Vault-Token", token)
+	
+	// Make request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("vault returned status %d", resp.StatusCode)
+	}
+	
+	// Read response
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+	
+	
+	// Parse JSON response
+	var vaultResponse map[string]interface{}
+	if err := json.Unmarshal(body, &vaultResponse); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON response: %w", err)
+	}
+	
+	
+	// Navigate to data.data.env (like Python: res['data']['data']['dev'])
+	data, ok := vaultResponse["data"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid response structure: no 'data' key")
+	}
+	
+	nestedData, ok := data["data"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid response structure: no nested 'data' key")
+	}
+	
+	
+	envData, exists := nestedData[env]
+	if !exists {
+		return nil, fmt.Errorf("no configuration found for environment: %s", env)
+	}
+	
+	// If it's a JSON string, parse it
+	if jsonStr, ok := envData.(string); ok {
+		var config map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &config); err != nil {
+			return nil, fmt.Errorf("failed to parse JSON configuration for env %s: %w", env, err)
+		}
+		return config, nil
+	}
+	
+	// If it's already a map, return it directly
+	if configMap, ok := envData.(map[string]interface{}); ok {
+		return configMap, nil
+	}
+	
+	return nil, fmt.Errorf("unexpected data type for environment %s", env)
 }

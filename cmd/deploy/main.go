@@ -16,34 +16,51 @@ func main() {
 	// Create a context
 	ctx := context.Background()
 
+	// Get environment variables with defaults
+	defaultPath := os.Getenv("TF_PATH")
+	defaultEnv := os.Getenv("TF_ENV")
+	if defaultEnv == "" {
+		defaultEnv = "dev"
+	}
+	defaultAction := os.Getenv("TF_ACTION")
+	if defaultAction == "" {
+		defaultAction = "plan"
+	}
+	defaultVaultAddr := os.Getenv("VAULT_ADDR")
+
 	// Define command-line flags
 	var (
-		pathFlag      = flag.String("path", "", "Path to Terraform code")
-		stackFlag     = flag.String("stack", "", "Stack name (if using app/stacks structure)")
-		envFlag       = flag.String("env", "dev", "Environment name")
-		varsFileFlag  = flag.String("vars-file", "", "Path to tfvars file")
-		actionFlag    = flag.String("action", "plan", "Terraform action (plan, apply, destroy)")
-		vaultAddrFlag = flag.String("vault-addr", "", "Vault server address")
+		pathFlag      string
+		stackFlag     string
+		envFlag       string
+		varsFileFlag  string
+		actionFlag    string
+		vaultAddrFlag string
 	)
 
-	// Custom short flags
-	flag.StringVar(pathFlag, "p", "", "Path to Terraform code (shorthand)")
-	flag.StringVar(stackFlag, "s", "", "Stack name (shorthand)")
-	flag.StringVar(envFlag, "e", "dev", "Environment name (shorthand)")
-	flag.StringVar(varsFileFlag, "v", "", "Path to tfvars file (shorthand)")
+	flag.StringVar(&pathFlag, "path", defaultPath, "Path to Terraform code")
+	flag.StringVar(&pathFlag, "p", defaultPath, "Path to Terraform code (shorthand)")
+	flag.StringVar(&stackFlag, "stack", "", "Stack name (if using app/stacks structure)")
+	flag.StringVar(&stackFlag, "s", "", "Stack name (shorthand)")
+	flag.StringVar(&envFlag, "env", defaultEnv, "Environment name")
+	flag.StringVar(&envFlag, "e", defaultEnv, "Environment name (shorthand)")
+	flag.StringVar(&varsFileFlag, "vars-file", "", "Path to tfvars file")
+	flag.StringVar(&varsFileFlag, "v", "", "Path to tfvars file (shorthand)")
+	flag.StringVar(&actionFlag, "action", defaultAction, "Terraform action (plan, apply, destroy)")
+	flag.StringVar(&vaultAddrFlag, "vault-addr", defaultVaultAddr, "Vault server address")
 
 	// Parse flags
 	flag.Parse()
 
 	// Validate required inputs
-	if *pathFlag == "" && *stackFlag == "" {
+	if pathFlag == "" && stackFlag == "" {
 		fmt.Println("Error: either --path or --stack flag is required")
 		flag.Usage()
 		os.Exit(1)
 	}
 
 	// Load configuration
-	cfg, err := config.LoadConfig(*envFlag)
+	cfg, err := config.LoadConfig(envFlag)
 	if err != nil {
 		fmt.Printf("Error loading configuration: %v\n", err)
 		os.Exit(1)
@@ -52,18 +69,18 @@ func main() {
 	// Determine paths
 	var terraformPath, varsFilePath string
 
-	if *pathFlag != "" {
-		terraformPath = *pathFlag
+	if pathFlag != "" {
+		terraformPath = pathFlag
 	} else {
 		// Use stack path template from config
-		terraformPath = cfg.ResolveStackPath(*stackFlag)
+		terraformPath = cfg.ResolveStackPath(stackFlag)
 	}
 
-	if *varsFileFlag != "" {
-		varsFilePath = *varsFileFlag
-	} else if *stackFlag != "" {
+	if varsFileFlag != "" {
+		varsFilePath = varsFileFlag
+	} else if stackFlag != "" {
 		// Use vars path template from config
-		varsFilePath = cfg.ResolveVarsPath(*envFlag, *stackFlag)
+		varsFilePath = cfg.ResolveVarsPath(envFlag, stackFlag)
 	}
 
 	// Validate paths
@@ -80,7 +97,7 @@ func main() {
 	}
 
 	// Initialize Vault client
-	vaultAddr := *vaultAddrFlag
+	vaultAddr := vaultAddrFlag
 	if vaultAddr == "" {
 		vaultAddr = cfg.Vault.Address
 	}
@@ -102,8 +119,8 @@ func main() {
 
 	// Get provider configuration from Vault
 	fmt.Println("Retrieving provider configuration...")
-	providerPath := cfg.ResolveProviderPath(*envFlag)
-	providerConfig, err := vaultClient.GetProviderConfig(ctx, providerPath)
+	providerPath := cfg.ResolveProviderPath(envFlag)
+	providerConfig, err := vaultClient.GetProviderConfig(ctx, providerPath, envFlag)
 	if err != nil {
 		fmt.Printf("Error retrieving provider configuration: %v\n", err)
 		os.Exit(1)
@@ -118,8 +135,33 @@ func main() {
 	}
 	defer executor.Clean()
 
+	// Get or create S3 backend configuration
+	var backendConfig *terraform.S3BackendConfig
+
+	// Check if the environment has a backend configuration
+	if envConfig, ok := cfg.Environments[envFlag]; ok && envConfig.Backend.Type == "s3" {
+		// Create S3 backend config
+		s3Config := terraform.S3BackendConfig{
+			Bucket:  fmt.Sprintf("%v", envConfig.Backend.Config["bucket"]),
+			Key:     fmt.Sprintf("%v", envConfig.Backend.Config["key"]),
+			Region:  fmt.Sprintf("%v", envConfig.Backend.Config["region"]),
+			Encrypt: true,
+		}
+
+		// Add DynamoDB table if specified
+		if dynamo, ok := envConfig.Backend.Config["dynamodb_table"]; ok {
+			s3Config.DynamoDBTable = fmt.Sprintf("%v", dynamo)
+		}
+
+		// Process template variables in paths
+		s3Config = terraform.ResolveS3BackendConfig(ctx, s3Config, envFlag, stackFlag)
+		backendConfig = &s3Config
+
+		fmt.Printf("Using S3 backend: %s/%s in %s\n", s3Config.Bucket, s3Config.Key, s3Config.Region)
+	}
+
 	// Setup Terraform workspace
-	err = executor.Setup(ctx, terraformPath, providerConfig)
+	err = executor.Setup(ctx, terraformPath, providerConfig, backendConfig)
 	if err != nil {
 		fmt.Printf("Error setting up Terraform workspace: %v\n", err)
 		os.Exit(1)
@@ -134,8 +176,8 @@ func main() {
 	}
 
 	// Execute requested action
-	fmt.Printf("Executing Terraform %s...\n", *actionFlag)
-	switch *actionFlag {
+	fmt.Printf("Executing Terraform %s...\n", actionFlag)
+	switch actionFlag {
 	case "plan":
 		plan, err := executor.Plan(ctx, varsFilePath)
 		if err != nil {
@@ -189,7 +231,7 @@ func main() {
 		fmt.Println("Destroy complete!")
 
 	default:
-		fmt.Printf("Unsupported action: %s\n", *actionFlag)
+		fmt.Printf("Unsupported action: %s\n", actionFlag)
 		os.Exit(1)
 	}
 
