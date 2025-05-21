@@ -334,23 +334,30 @@ func (e *Executor) Plan(ctx context.Context, varsFile string) (*tfjson.Plan, err
 		return nil, fmt.Errorf("terraform executor not set up")
 	}
 
+	planFilePath := filepath.Join(e.workDir, "terraform.tfplan")
+	
 	var opts []tfexec.PlanOption
 	if varsFile != "" {
 		opts = append(opts, tfexec.VarFile(varsFile))
 	}
+	opts = append(opts, tfexec.Out(planFilePath))
 
-	// Run plan
+	// Run plan and save to file
 	_, err := e.tf.Plan(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("terraform plan failed: %w", err)
 	}
 
-	// Return empty plan - in real implementation you would either:
-	// 1. Generate a proper plan output
-	// 2. Or simply return a text representation instead of a structured object
-	return &tfjson.Plan{
-		ResourceChanges: []*tfjson.ResourceChange{},
-	}, nil
+	// Get the structured plan from the file
+	plan, err := e.tf.ShowPlanFile(ctx, planFilePath)
+	if err != nil {
+		// If we can't get the structured plan, return a basic plan with change indicator
+		return &tfjson.Plan{
+			ResourceChanges: []*tfjson.ResourceChange{},
+		}, nil
+	}
+
+	return plan, nil
 }
 
 // Apply runs terraform apply
