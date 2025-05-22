@@ -603,11 +603,13 @@ func (vc *VariableCompiler) parseVariablesTf(filename string) (map[string]Terraf
 		if inVariable {
 			// Count braces to track nesting
 			braceCount += strings.Count(line, "{") - strings.Count(line, "}")
+			
 
 			// Look for default block
 			if strings.Contains(line, "default") && strings.Contains(line, "=") && !inType {
 				inDefault = true
 				defaultContent = []string{}
+				fmt.Printf("[DEBUG] Found default line for %s: %s\n", currentVar, line)
 
 				// Handle simple defaults on same line
 				if strings.Contains(line, "{}") {
@@ -649,8 +651,8 @@ func (vc *VariableCompiler) parseVariablesTf(filename string) (map[string]Terraf
 				continue
 			}
 
-			// Look for type block (to extract optional defaults)
-			if strings.Contains(line, "type") && strings.Contains(line, "=") && !inDefault {
+			// Look for type block (to extract optional defaults) - only for object types
+			if strings.Contains(line, "type") && strings.Contains(line, "=") && strings.Contains(line, "object(") && !inDefault {
 				inType = true
 				typeContent = []string{}
 				typeContent = append(typeContent, line)

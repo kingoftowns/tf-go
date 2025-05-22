@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -35,6 +36,7 @@ func main() {
 		varsFileFlag  string
 		actionFlag    string
 		vaultAddrFlag string
+		saveWorkspace string
 	)
 
 	flag.StringVar(&pathFlag, "path", defaultPath, "Path to Terraform code")
@@ -47,6 +49,7 @@ func main() {
 	flag.StringVar(&varsFileFlag, "v", "", "Path to tfvars file (shorthand)")
 	flag.StringVar(&actionFlag, "action", defaultAction, "Terraform action (plan, apply, destroy)")
 	flag.StringVar(&vaultAddrFlag, "vault-addr", defaultVaultAddr, "Vault server address")
+	flag.StringVar(&saveWorkspace, "save-workspace", "", "Save terraform workspace to this directory path")
 
 	flag.Parse()
 
@@ -237,8 +240,53 @@ func main() {
 
 			if toChange > 0 {
 				fmt.Println("\nResources to change:")
-				for _, r := range changeResources {
-					fmt.Printf("  ~ %s\n", r)
+				for _, rc := range plan.ResourceChanges {
+					if rc.Change != nil && rc.Change.Actions.Update() {
+						fmt.Printf("  ~ %s (%s)\n", rc.Address, rc.Type)
+						
+						// Show what's changing
+						if rc.Change.Before != nil && rc.Change.After != nil {
+							fmt.Printf("      Changes:\n")
+							beforeMap, _ := rc.Change.Before.(map[string]interface{})
+							afterMap, _ := rc.Change.After.(map[string]interface{})
+							
+							// Compare before and after to show specific changes
+							for key, afterVal := range afterMap {
+								if beforeVal, exists := beforeMap[key]; exists {
+									beforeStr := fmt.Sprintf("%v", beforeVal)
+									afterStr := fmt.Sprintf("%v", afterVal)
+									if beforeStr != afterStr {
+										// Truncate very long values for readability
+										if len(beforeStr) > 100 {
+											beforeStr = beforeStr[:97] + "..."
+										}
+										if len(afterStr) > 100 {
+											afterStr = afterStr[:97] + "..."
+										}
+										fmt.Printf("        ~ %s: %s -> %s\n", key, beforeStr, afterStr)
+									}
+								} else {
+									afterStr := fmt.Sprintf("%v", afterVal)
+									if len(afterStr) > 100 {
+										afterStr = afterStr[:97] + "..."
+									}
+									fmt.Printf("        + %s: %s\n", key, afterStr)
+								}
+							}
+							
+							// Check for removed attributes
+							for key, beforeVal := range beforeMap {
+								if _, exists := afterMap[key]; !exists {
+									beforeStr := fmt.Sprintf("%v", beforeVal)
+									if len(beforeStr) > 100 {
+										beforeStr = beforeStr[:97] + "..."
+									}
+									fmt.Printf("        - %s: %s\n", key, beforeStr)
+								}
+							}
+						}
+						fmt.Println()
+					}
 				}
 			}
 
@@ -281,5 +329,77 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Save workspace if requested
+	if saveWorkspace != "" {
+		fmt.Printf("Saving workspace to: %s\n", saveWorkspace)
+		err := copyDir(executor.GetWorkDir(), saveWorkspace)
+		if err != nil {
+			fmt.Printf("Error saving workspace: %v\n", err)
+		} else {
+			fmt.Printf("Workspace saved successfully to: %s\n", saveWorkspace)
+		}
+	}
+
 	fmt.Println("Operation completed successfully.")
+}
+
+// copyDir recursively copies a directory
+func copyDir(src, dst string) error {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	if err = os.MkdirAll(dst, srcInfo.Mode()); err != nil {
+		return err
+	}
+
+	items, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+
+	for _, item := range items {
+		srcPath := filepath.Join(src, item.Name())
+		dstPath := filepath.Join(dst, item.Name())
+
+		if item.IsDir() {
+			if err = copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+		} else {
+			if err = copyFile(srcPath, dstPath); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// copyFile copies a single file
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	if err != nil {
+		return err
+	}
+
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	return os.Chmod(dst, srcInfo.Mode())
 }

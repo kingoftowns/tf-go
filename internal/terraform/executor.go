@@ -278,8 +278,18 @@ func (e *Executor) Setup(ctx context.Context, srcPath string, providerConfig map
 	}
 	
 	// Also copy global configuration files if they exist
-	// Look for config/terraform directory relative to the parent of srcPath
-	configPath := filepath.Join(filepath.Dir(filepath.Dir(srcPath)), "config", "terraform")
+	// Look for config/terraform directory - handle both stack and non-stack paths
+	var configPath string
+	if strings.Contains(srcPath, "/app/stacks/") {
+		// For stack paths, go up to TF_PATH root and find config/terraform
+		pathParts := strings.Split(srcPath, "/app/stacks/")
+		if len(pathParts) > 0 {
+			configPath = filepath.Join(pathParts[0], "config", "terraform")
+		}
+	} else {
+		// For non-stack paths, use the original logic
+		configPath = filepath.Join(filepath.Dir(filepath.Dir(srcPath)), "config", "terraform")
+	}
 	if _, err := os.Stat(configPath); err == nil {
 		fmt.Printf("[DEBUG] Found global config at: %s\n", configPath)
 		
