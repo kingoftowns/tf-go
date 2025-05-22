@@ -44,11 +44,9 @@ func NewClient(address string) (*Client, error) {
 func (c *Client) Authenticate(ctx context.Context, cfg *config.Config) error {
 	switch cfg.Vault.AuthMethod {
 	case "token":
-		// Try to get token from environment variable first
 		token := os.Getenv("VAULT_TOKEN")
 		fmt.Printf("DEBUG: Token from env: %s\n", token)
 		if token == "" {
-			// Fallback to reading from token file
 			homeDir, err := os.UserHomeDir()
 			if err != nil {
 				return fmt.Errorf("failed to get home directory: %w", err)
@@ -72,108 +70,66 @@ func (c *Client) Authenticate(ctx context.Context, cfg *config.Config) error {
 		fmt.Printf("DEBUG: Token authentication successful\n")
 		return nil
 
-	case "approle":
-		// Check for role ID and secret ID
-		roleID := os.Getenv("VAULT_ROLE_ID")
-		if roleID == "" && cfg.Vault.RoleName != "" {
-			roleID = cfg.Vault.RoleName
-		}
-
-		secretID := os.Getenv("VAULT_SECRET_ID")
-		if secretID == "" && cfg.Vault.SecretID != "" {
-			secretID = cfg.Vault.SecretID
-		}
-
-		if roleID == "" || secretID == "" {
-			return fmt.Errorf("missing role ID or secret ID for AppRole authentication")
-		}
-
-		data := map[string]interface{}{
-			"role_id":   roleID,
-			"secret_id": secretID,
-		}
-
-		resp, err := c.client.Logical().Write("auth/approle/login", data)
-		if err != nil {
-			return fmt.Errorf("failed to authenticate with AppRole: %w", err)
-		}
-
-		c.client.SetToken(resp.Auth.ClientToken)
-		return nil
-
 	default:
 		return fmt.Errorf("unsupported authentication method: %s", cfg.Vault.AuthMethod)
 	}
 }
 
-// GetProviderConfig retrieves provider configuration from Vault using direct HTTP
 func (c *Client) GetProviderConfig(ctx context.Context, path, env string) (map[string]interface{}, error) {
-	// Get vault address and build full URL
 	vaultAddr := os.Getenv("VAULT_ADDR")
 	if vaultAddr == "" {
 		vaultAddr = "http://127.0.0.1:8200"
 	}
-	
-	// Build full URL - add /v1/ prefix for Vault API
+
 	url := vaultAddr + "/v1/" + path
-	
-	// Create HTTP request
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
-	
-	// Add vault token header
+
 	token := os.Getenv("VAULT_TOKEN")
 	if token == "" {
 		return nil, fmt.Errorf("VAULT_TOKEN not set")
 	}
 	req.Header.Set("X-Vault-Token", token)
-	
-	// Make request
+
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to make HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("vault returned status %d", resp.StatusCode)
 	}
-	
-	// Read response
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
-	
-	
-	// Parse JSON response
+
 	var vaultResponse map[string]interface{}
 	if err := json.Unmarshal(body, &vaultResponse); err != nil {
 		return nil, fmt.Errorf("failed to parse JSON response: %w", err)
 	}
-	
-	
-	// Navigate to data.data.env (like Python: res['data']['data']['dev'])
+
+	// Navigate to data.data.{{env}}
 	data, ok := vaultResponse["data"].(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("invalid response structure: no 'data' key")
 	}
-	
+
 	nestedData, ok := data["data"].(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("invalid response structure: no nested 'data' key")
 	}
-	
-	
+
 	envData, exists := nestedData[env]
 	if !exists {
 		return nil, fmt.Errorf("no configuration found for environment: %s", env)
 	}
-	
-	// If it's a JSON string, parse it
+
 	if jsonStr, ok := envData.(string); ok {
 		var config map[string]interface{}
 		if err := json.Unmarshal([]byte(jsonStr), &config); err != nil {
@@ -181,11 +137,10 @@ func (c *Client) GetProviderConfig(ctx context.Context, path, env string) (map[s
 		}
 		return config, nil
 	}
-	
-	// If it's already a map, return it directly
+
 	if configMap, ok := envData.(map[string]interface{}); ok {
 		return configMap, nil
 	}
-	
+
 	return nil, fmt.Errorf("unexpected data type for environment %s", env)
 }

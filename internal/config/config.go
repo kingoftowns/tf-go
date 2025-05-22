@@ -68,10 +68,10 @@ func LoadConfig(env string) (*Config, error) {
 	}
 
 	// Set default configuration
-	cfg.Defaults.Environment = "dev"
+	cfg.Defaults.Environment = "dev-devops"
 	cfg.Defaults.VarsPathTemplate = "./tfvars/{{env}}/{{stack}}.tfvars"
 	cfg.Defaults.StackPathTemplate = "./app/stacks/{{stack}}"
-	cfg.Defaults.ProviderPathTemplate = "kv/data/terraform/providers"
+	cfg.Defaults.ProviderPathTemplate = "terraform/data/providers"
 	cfg.Terraform.BackendType = "local"
 	cfg.Vault.Address = "http://127.0.0.1:8200"
 	cfg.Vault.AuthMethod = "token"

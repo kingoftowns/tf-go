@@ -13,14 +13,12 @@ import (
 )
 
 func main() {
-	// Create a context
 	ctx := context.Background()
 
-	// Get environment variables with defaults
 	defaultPath := os.Getenv("TF_PATH")
 	defaultEnv := os.Getenv("TF_ENV")
 	if defaultEnv == "" {
-		defaultEnv = "dev"
+		defaultEnv = "dev-devops"
 	}
 	defaultAction := os.Getenv("TF_ACTION")
 	if defaultAction == "" {
@@ -28,7 +26,6 @@ func main() {
 	}
 	defaultVaultAddr := os.Getenv("VAULT_ADDR")
 
-	// Define command-line flags
 	var (
 		pathFlag      string
 		stackFlag     string
@@ -49,41 +46,34 @@ func main() {
 	flag.StringVar(&actionFlag, "action", defaultAction, "Terraform action (plan, apply, destroy)")
 	flag.StringVar(&vaultAddrFlag, "vault-addr", defaultVaultAddr, "Vault server address")
 
-	// Parse flags
 	flag.Parse()
 
-	// Validate required inputs
 	if pathFlag == "" && stackFlag == "" {
 		fmt.Println("Error: either --path or --stack flag is required")
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	// Load configuration
 	cfg, err := config.LoadConfig(envFlag)
 	if err != nil {
 		fmt.Printf("Error loading configuration: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Determine paths
 	var terraformPath, varsFilePath string
 
 	if pathFlag != "" {
 		terraformPath = pathFlag
 	} else {
-		// Use stack path template from config
 		terraformPath = cfg.ResolveStackPath(stackFlag)
 	}
 
 	if varsFileFlag != "" {
 		varsFilePath = varsFileFlag
 	} else if stackFlag != "" {
-		// Use vars path template from config
 		varsFilePath = cfg.ResolveVarsPath(envFlag, stackFlag)
 	}
 
-	// Validate paths
 	if _, err := os.Stat(terraformPath); os.IsNotExist(err) {
 		fmt.Printf("Error: Terraform path does not exist: %s\n", terraformPath)
 		os.Exit(1)
@@ -96,7 +86,6 @@ func main() {
 		}
 	}
 
-	// Initialize Vault client
 	vaultAddr := vaultAddrFlag
 	if vaultAddr == "" {
 		vaultAddr = cfg.Vault.Address
@@ -108,8 +97,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Authenticate with Vault
-	// This would need to be implemented based on your auth method
 	fmt.Println("Authenticating with Vault...")
 	err = vaultClient.Authenticate(ctx, cfg)
 	if err != nil {
@@ -117,7 +104,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Get provider configuration from Vault
 	fmt.Println("Retrieving provider configuration...")
 	providerPath := cfg.ResolveProviderPath(envFlag)
 	providerConfig, err := vaultClient.GetProviderConfig(ctx, providerPath, envFlag)
@@ -126,7 +112,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create Terraform executor
 	fmt.Println("Setting up Terraform workspace...")
 	executor, err := terraform.NewExecutor(ctx)
 	if err != nil {
@@ -135,12 +120,9 @@ func main() {
 	}
 	defer executor.Clean()
 
-	// Get or create S3 backend configuration
 	var backendConfig *terraform.S3BackendConfig
 
-	// Check if the environment has a backend configuration
 	if envConfig, ok := cfg.Environments[envFlag]; ok && envConfig.Backend.Type == "s3" {
-		// Create S3 backend config
 		s3Config := terraform.S3BackendConfig{
 			Bucket:  fmt.Sprintf("%v", envConfig.Backend.Config["bucket"]),
 			Key:     fmt.Sprintf("%v", envConfig.Backend.Config["key"]),
@@ -148,26 +130,22 @@ func main() {
 			Encrypt: true,
 		}
 
-		// Add DynamoDB table if specified
 		if dynamo, ok := envConfig.Backend.Config["dynamodb_table"]; ok {
 			s3Config.DynamoDBTable = fmt.Sprintf("%v", dynamo)
 		}
 
-		// Process template variables in paths
 		s3Config = terraform.ResolveS3BackendConfig(ctx, s3Config, envFlag, stackFlag)
 		backendConfig = &s3Config
 
 		fmt.Printf("Using S3 backend: %s/%s in %s\n", s3Config.Bucket, s3Config.Key, s3Config.Region)
 	}
 
-	// Setup Terraform workspace
 	err = executor.Setup(ctx, terraformPath, providerConfig, backendConfig)
 	if err != nil {
 		fmt.Printf("Error setting up Terraform workspace: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Initialize Terraform
 	fmt.Println("Initializing Terraform...")
 	err = executor.Init(ctx)
 	if err != nil {
@@ -175,7 +153,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Execute requested action
 	fmt.Printf("Executing Terraform %s...\n", actionFlag)
 	switch actionFlag {
 	case "plan":
@@ -185,7 +162,6 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Print plan summary
 		if plan.ResourceChanges != nil {
 			var toAdd, toChange, toDestroy int
 			for _, rc := range plan.ResourceChanges {
@@ -211,7 +187,6 @@ func main() {
 		}
 		fmt.Println("Apply complete!")
 
-		// Print outputs
 		outputs, err := executor.Output(ctx)
 		if err != nil {
 			fmt.Printf("Error getting outputs: %v\n", err)
