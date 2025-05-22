@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	dynamodbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
@@ -24,6 +25,7 @@ type S3BackendConfig struct {
 	DynamoDBTable  string
 	Encrypt        bool
 	RoleARN        string
+	Profile        string
 }
 
 // EnsureS3Backend creates the S3 bucket and DynamoDB table if they don't exist
@@ -163,6 +165,9 @@ func GenerateBackendConfig(cfg S3BackendConfig) map[string]interface{} {
 
 // CreateBackendFile generates a backend.tf file for Terraform
 func (e *Executor) CreateBackendFile(cfg S3BackendConfig) error {
+	// Check if AWS_PROFILE is set and use it in the backend config
+	profile := os.Getenv("AWS_PROFILE")
+	
 	backendContent := `
 terraform {
   backend "s3" {
@@ -178,9 +183,17 @@ terraform {
     {{- if .RoleARN }}
     role_arn       = "{{.RoleARN}}"
     {{- end }}
+    {{- if .Profile }}
+    profile        = "{{.Profile}}"
+    {{- end }}
   }
 }
 `
+	
+	// Add profile to config if set
+	if profile != "" {
+		cfg.Profile = profile
+	}
 	
 	tmpl, err := template.New("backend").Parse(backendContent)
 	if err != nil {
@@ -202,12 +215,64 @@ func ResolveS3BackendConfig(ctx context.Context, input S3BackendConfig, env, sta
 	// Create a copy of the input config
 	result := input
 	
-	// Process string templating for bucket and key
+	// Get AWS account ID for bucket naming
+	accountID := os.Getenv("AWS_ACCOUNT_ID")
+	fmt.Printf("[DEBUG] AWS_ACCOUNT_ID env var: %s\n", accountID)
+	
+	if accountID == "" {
+		// Try to get account ID from AWS profile if available
+		profile := os.Getenv("AWS_PROFILE")
+		fmt.Printf("[DEBUG] AWS_PROFILE env var: %s\n", profile)
+		
+		if profile != "" {
+			fmt.Printf("[DEBUG] Attempting to load AWS config with profile: %s\n", profile)
+			if awsCfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile)); err == nil {
+				fmt.Printf("[DEBUG] Successfully loaded AWS config\n")
+				stsClient := sts.NewFromConfig(awsCfg)
+				if identity, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{}); err == nil && identity.Account != nil {
+					accountID = *identity.Account
+					fmt.Printf("[DEBUG] Got account ID from STS: %s\n", accountID)
+				} else {
+					fmt.Printf("[DEBUG] Failed to get caller identity: %v\n", err)
+				}
+			} else {
+				fmt.Printf("[DEBUG] Failed to load AWS config: %v\n", err)
+			}
+		}
+		// Fallback if we still can't get it
+		if accountID == "" {
+			fmt.Printf("[DEBUG] Using fallback account ID: ACCOUNT\n")
+			accountID = "ACCOUNT"
+		}
+	}
+	
+	// If input config is empty, use the backend.rb equivalent logic
+	if result.Bucket == "" {
+		result.Bucket = fmt.Sprintf("terraform-state-k8s-cluster-info-%s", accountID)
+	}
+	
+	if result.Key == "" {
+		result.Key = fmt.Sprintf("%s/%s/terraform.tfstate", env, stack)
+	}
+	
+	if result.DynamoDBTable == "" {
+		result.DynamoDBTable = "terraform_locks_k8s-cluster-info"
+	}
+	
+	if result.Region == "" {
+		result.Region = "us-gov-west-1" // Default region from your backend.rb
+	}
+	
+	result.Encrypt = true // Always encrypt as per backend.rb
+	
+	// Process string templating for any remaining placeholders
 	result.Bucket = strings.ReplaceAll(result.Bucket, ":ENV", env)
 	result.Bucket = strings.ReplaceAll(result.Bucket, ":STACK", stack)
+	result.Bucket = strings.ReplaceAll(result.Bucket, ":ACCOUNT", accountID)
 	
 	result.Key = strings.ReplaceAll(result.Key, ":ENV", env)
 	result.Key = strings.ReplaceAll(result.Key, ":STACK", stack)
+	result.Key = strings.ReplaceAll(result.Key, ":MOD_NAME", stack)
 	
 	if result.DynamoDBTable != "" {
 		result.DynamoDBTable = strings.ReplaceAll(result.DynamoDBTable, ":ENV", env)

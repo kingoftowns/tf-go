@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/kingoftowns/tf-go/internal/constants"
 	"gopkg.in/yaml.v3"
 )
 
@@ -68,13 +69,13 @@ func LoadConfig(env string) (*Config, error) {
 	}
 
 	// Set default configuration
-	cfg.Defaults.Environment = "dev-devops"
-	cfg.Defaults.VarsPathTemplate = "./tfvars/{{env}}/{{stack}}.tfvars"
-	cfg.Defaults.StackPathTemplate = "./app/stacks/{{stack}}"
-	cfg.Defaults.ProviderPathTemplate = "terraform/data/providers"
-	cfg.Terraform.BackendType = "local"
-	cfg.Vault.Address = "http://127.0.0.1:8200"
-	cfg.Vault.AuthMethod = "token"
+	cfg.Defaults.Environment = constants.DefaultEnvironment
+	cfg.Defaults.VarsPathTemplate = constants.DefaultVarsPathTemplate
+	cfg.Defaults.StackPathTemplate = constants.DefaultStackPathTemplate
+	cfg.Defaults.ProviderPathTemplate = constants.DefaultProviderPathTemplate
+	cfg.Terraform.BackendType = constants.DefaultTerraformBackendType
+	cfg.Vault.Address = constants.DefaultVaultAddress
+	cfg.Vault.AuthMethod = constants.DefaultVaultAuthMethod
 
 	// Look for optional project-local config files
 	globalConfigPath := "./config.yaml"
@@ -115,12 +116,115 @@ func (c *Config) ResolveStackPath(stack string) string {
 	return path
 }
 
-// ResolveVarsPath resolves the path to a vars file
-func (c *Config) ResolveVarsPath(env, stack string) string {
-	path := c.Defaults.VarsPathTemplate
-	path = strings.ReplaceAll(path, "{{env}}", env)
-	path = strings.ReplaceAll(path, "{{stack}}", stack)
-	return path
+// ResolveVarsPath resolves the paths to vars files, returning base.tfvars first (if exists) then env-specific tfvars
+func (c *Config) ResolveVarsPath(env, stack, terraformPath string) []string {
+	var varsPaths []string
+
+	fmt.Printf("[DEBUG] ResolveVarsPath: env=%s, stack=%s, terraformPath=%s\n", env, stack, terraformPath)
+
+	// Look in the tfvars subdirectory first
+	tfvarsPath := filepath.Join(terraformPath, "config", "terraform", "tfvars")
+	if _, err := os.Stat(tfvarsPath); err == nil {
+		fmt.Printf("[DEBUG] Found tfvars directory: %s\n", tfvarsPath)
+		terraformPath = tfvarsPath
+	}
+
+	// First check for base.tfvars recursively in the terraform directory (excluding hidden dirs)
+	fmt.Printf("[DEBUG] Looking for base.tfvars in directory: %s\n", terraformPath)
+	err := filepath.Walk(terraformPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			// Skip hidden directories
+			if strings.HasPrefix(info.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if info.Name() == "base.tfvars" {
+			fmt.Printf("[DEBUG] Found base.tfvars: %s\n", path)
+			varsPaths = append(varsPaths, path)
+			return filepath.SkipAll // Stop after first match
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		fmt.Printf("[DEBUG] Error walking directory for base.tfvars: %v\n", err)
+	}
+
+	// Find environment-specific tfvars files
+	// Look for exact match first: env.tfvars (recursive)
+	exactMatchFound := false
+	fmt.Printf("[DEBUG] Looking for exact match %s.tfvars\n", env)
+	err = filepath.Walk(terraformPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			// Skip hidden directories
+			if strings.HasPrefix(info.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if info.Name() == env+".tfvars" {
+			fmt.Printf("[DEBUG] Found exact match: %s\n", path)
+			varsPaths = append(varsPaths, path)
+			exactMatchFound = true
+			return filepath.SkipAll // Stop after first match
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		fmt.Printf("[DEBUG] Error walking directory for exact match: %v\n", err)
+	}
+
+	if exactMatchFound {
+		fmt.Printf("[DEBUG] Final varsPaths: %v\n", varsPaths)
+		return varsPaths
+	}
+
+	// If exact match not found, look for files containing the env name (recursive search)
+	fmt.Printf("[DEBUG] Looking for files containing env name in directory: %s\n", terraformPath)
+	err = filepath.Walk(terraformPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			// Skip hidden directories
+			if strings.HasPrefix(info.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		fileName := info.Name()
+		fmt.Printf("[DEBUG] Checking file: %s\n", path)
+		if strings.HasSuffix(fileName, ".tfvars") && strings.Contains(fileName, env) {
+			fmt.Printf("[DEBUG] Found matching file: %s\n", path)
+			varsPaths = append(varsPaths, path)
+			return filepath.SkipAll // Stop after first match
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		fmt.Printf("[DEBUG] Error walking directory: %v\n", err)
+	}
+
+	fmt.Printf("[DEBUG] Final varsPaths: %v\n", varsPaths)
+	return varsPaths
 }
 
 // ResolveProviderPath resolves the path to provider config in Vault

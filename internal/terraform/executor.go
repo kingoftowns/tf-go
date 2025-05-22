@@ -18,6 +18,7 @@ import (
 // Executor handles Terraform operations
 type Executor struct {
 	workDir    string
+	srcPath    string
 	tf         *tfexec.Terraform
 	envVars    map[string]string
 	cleanupFns []func() error
@@ -264,10 +265,48 @@ func ResolveDynamicValues(ctx context.Context, input map[string]interface{}) map
 
 // Setup prepares the Terraform workspace
 func (e *Executor) Setup(ctx context.Context, srcPath string, providerConfig map[string]interface{}, backendConfig *S3BackendConfig) error {
-	// Copy source files
+	fmt.Printf("[DEBUG] Copying Terraform files from: %s\n", srcPath)
+	fmt.Printf("[DEBUG] Working directory: %s\n", e.workDir)
+	
+	// Store source path for later use
+	e.srcPath = srcPath
+	
+	// Copy stack files
 	err := copyDir(srcPath, e.workDir)
 	if err != nil {
-		return fmt.Errorf("failed to copy Terraform files: %w", err)
+		return fmt.Errorf("failed to copy stack files: %w", err)
+	}
+	
+	// Also copy global configuration files if they exist
+	// Look for config/terraform directory relative to the parent of srcPath
+	configPath := filepath.Join(filepath.Dir(filepath.Dir(srcPath)), "config", "terraform")
+	if _, err := os.Stat(configPath); err == nil {
+		fmt.Printf("[DEBUG] Found global config at: %s\n", configPath)
+		
+		// Copy specific global files
+		globalFiles := []string{
+			"locals_global.tf",
+			"variables_global.tf", 
+			"terraform.tf",
+		}
+		
+		for _, filename := range globalFiles {
+			srcFile := filepath.Join(configPath, filename)
+			if _, err := os.Stat(srcFile); err == nil {
+				destFile := filepath.Join(e.workDir, filename)
+				if err := copyFile(srcFile, destFile); err == nil {
+					fmt.Printf("[DEBUG] Copied global file: %s\n", filename)
+				}
+			}
+		}
+	}
+	
+	// Debug: list what files were copied
+	if files, err := os.ReadDir(e.workDir); err == nil {
+		fmt.Printf("[DEBUG] Files in working directory:\n")
+		for _, file := range files {
+			fmt.Printf("  - %s\n", file.Name())
+		}
 	}
 
 	// Process provider config to resolve environment variables and dynamic values
@@ -280,15 +319,29 @@ func (e *Executor) Setup(ctx context.Context, srcPath string, providerConfig map
 	if err != nil {
 		return fmt.Errorf("failed to create provider file: %w", err)
 	}
+	
+	// Debug: show what provider.tf was actually generated
+	if providerContent, err := os.ReadFile(filepath.Join(e.workDir, "provider.tf")); err == nil {
+		fmt.Printf("[DEBUG] Generated provider.tf content:\n%s\n", string(providerContent))
+	}
+	
+	// Debug: verify kubeconfig accessibility if kubernetes provider is configured
+	if kubernetesConfig, ok := resolvedConfig["kubernetes"].(map[string]interface{}); ok {
+		if configPath, ok := kubernetesConfig["config_path"].(string); ok {
+			if _, err := os.Stat(configPath); err != nil {
+				fmt.Printf("[WARNING] Kubeconfig file not found: %s (error: %v)\n", configPath, err)
+			} else {
+				fmt.Printf("[DEBUG] Kubeconfig file found: %s\n", configPath)
+				if context, ok := kubernetesConfig["config_context"].(string); ok {
+					fmt.Printf("[DEBUG] Using kubernetes context: %s\n", context)
+				}
+			}
+		}
+	}
 
 	// Setup backend if provided
 	if backendConfig != nil {
-		// Ensure S3 bucket and DynamoDB table exist
-		if err := EnsureS3Backend(ctx, *backendConfig); err != nil {
-			return fmt.Errorf("failed to ensure S3 backend: %w", err)
-		}
-
-		// Create backend.tf file
+		// Create backend.tf file (skip S3 bucket creation for now)
 		if err := e.CreateBackendFile(*backendConfig); err != nil {
 			return fmt.Errorf("failed to create backend file: %w", err)
 		}
@@ -329,46 +382,148 @@ func (e *Executor) Init(ctx context.Context) error {
 }
 
 // Plan runs terraform plan
-func (e *Executor) Plan(ctx context.Context, varsFile string) (*tfjson.Plan, error) {
+func (e *Executor) Plan(ctx context.Context, varsFiles []string) (*tfjson.Plan, error) {
 	if e.tf == nil {
 		return nil, fmt.Errorf("terraform executor not set up")
 	}
 
 	planFilePath := filepath.Join(e.workDir, "terraform.tfplan")
 	
+	fmt.Printf("[DEBUG] Creating plan file at: %s\n", planFilePath)
+
+	// Compile variables from multiple tfvars files (base first, then env-specific)
 	var opts []tfexec.PlanOption
-	if varsFile != "" {
-		opts = append(opts, tfexec.VarFile(varsFile))
+	compiledVarsFile := filepath.Join(e.workDir, "compiled.tfvars")
+	
+	if len(varsFiles) > 0 {
+		fmt.Printf("[DEBUG] Compiling %d tfvars files with variables.tf defaults\n", len(varsFiles))
+		// Pass both source path and work dir so we can find variables.tf in source and write to work dir
+		err := CompileWithVariablesTfFromSource(varsFiles, e.srcPath, e.workDir, compiledVarsFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compile tfvars: %w", err)
+		}
+		
+		// Use only the compiled vars file
+		opts = []tfexec.PlanOption{
+			tfexec.VarFile(compiledVarsFile),
+			tfexec.Out(planFilePath),
+		}
+		
+		fmt.Printf("[DEBUG] Using compiled vars file: %s\n", compiledVarsFile)
+	} else {
+		opts = []tfexec.PlanOption{tfexec.Out(planFilePath)}
 	}
-	opts = append(opts, tfexec.Out(planFilePath))
 
 	// Run plan and save to file
-	_, err := e.tf.Plan(ctx, opts...)
+	fmt.Println("[DEBUG] Executing terraform plan command...")
+	hasChanges, err := e.tf.Plan(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("terraform plan failed: %w", err)
 	}
+	fmt.Printf("[DEBUG] Plan complete. Has changes: %v\n", hasChanges)
+	
+	// If no changes detected, let's run a more detailed plan to see what's happening
+	if !hasChanges {
+		fmt.Println("[DEBUG] No changes detected, running detailed plan for debugging...")
+		
+		// Check if there are any .tf files that define resources
+		tfFiles, _ := filepath.Glob(filepath.Join(e.workDir, "*.tf"))
+		fmt.Printf("[DEBUG] Found %d .tf files in working directory\n", len(tfFiles))
+		
+		// Check current state to see what resources Terraform thinks exist
+		if state, err := e.tf.Show(ctx); err == nil && state != nil && state.Values != nil && state.Values.RootModule != nil {
+			fmt.Printf("[DEBUG] Current state contains %d resources\n", len(state.Values.RootModule.Resources))
+			if len(state.Values.RootModule.Resources) > 0 {
+				fmt.Println("[DEBUG] Resources in current state:")
+				for _, resource := range state.Values.RootModule.Resources {
+					fmt.Printf("  - %s\n", resource.Address)
+				}
+			}
+		} else {
+			fmt.Printf("[DEBUG] Could not read current state: %v\n", err)
+		}
+		
+		// Try to run terraform plan without saving to file to see raw output
+		planOpts := []tfexec.PlanOption{}
+		for _, varsFile := range varsFiles {
+			if varsFile != "" {
+				planOpts = append(planOpts, tfexec.VarFile(varsFile))
+			}
+		}
+		
+		// Run plan again without file output to get console output
+		_, debugErr := e.tf.Plan(ctx, planOpts...)
+		if debugErr != nil {
+			fmt.Printf("[DEBUG] Debug plan also failed: %v\n", debugErr)
+		}
+	}
 
 	// Get the structured plan from the file
+	fmt.Println("[DEBUG] Reading plan file to extract structured data...")
 	plan, err := e.tf.ShowPlanFile(ctx, planFilePath)
 	if err != nil {
-		// If we can't get the structured plan, return a basic plan with change indicator
-		return &tfjson.Plan{
-			ResourceChanges: []*tfjson.ResourceChange{},
-		}, nil
+		fmt.Printf("[DEBUG] Error reading plan file: %v\n", err)
+		
+		// Try to read raw plan file contents for debugging
+		fmt.Println("[DEBUG] Attempting to read raw plan file...")
+		rawPlan, readErr := os.ReadFile(planFilePath)
+		if readErr == nil {
+			fmt.Println("[DEBUG] Raw plan file contents (first 500 bytes):")
+			if len(rawPlan) > 500 {
+				fmt.Printf("%s...\n", rawPlan[:500])
+			} else {
+				fmt.Printf("%s\n", rawPlan)
+			}
+		} else {
+			fmt.Printf("[DEBUG] Failed to read raw plan file: %v\n", readErr)
+		}
+		
+		// Return error instead of empty plan
+		return nil, fmt.Errorf("failed to parse plan file: %w", err)
+	}
+
+	// Log plan details for debugging
+	fmt.Printf("[DEBUG] Plan format version: %s\n", plan.FormatVersion)
+	fmt.Printf("[DEBUG] Terraform version: %s\n", plan.TerraformVersion)
+	fmt.Printf("[DEBUG] Resource changes count: %d\n", len(plan.ResourceChanges))
+	
+	// Log detailed resource changes
+	if len(plan.ResourceChanges) > 0 {
+		fmt.Println("[DEBUG] Resource changes details:")
+		for i, rc := range plan.ResourceChanges {
+			if rc.Change != nil {
+				action := "unknown"
+				if rc.Change.Actions.Create() {
+					action = "create"
+				} else if rc.Change.Actions.Update() {
+					action = "update"
+				} else if rc.Change.Actions.Delete() {
+					action = "delete"
+				}
+				fmt.Printf("  [%d] %s: %s (%s)\n", i, rc.Address, rc.Type, action)
+			}
+		}
 	}
 
 	return plan, nil
 }
 
 // Apply runs terraform apply
-func (e *Executor) Apply(ctx context.Context, varsFile string) error {
+func (e *Executor) Apply(ctx context.Context, varsFiles []string) error {
 	if e.tf == nil {
 		return fmt.Errorf("terraform executor not set up")
 	}
 
 	var opts []tfexec.ApplyOption
-	if varsFile != "" {
-		opts = append(opts, tfexec.VarFile(varsFile))
+	
+	// Compile variables if files provided
+	if len(varsFiles) > 0 {
+		compiledVarsFile := filepath.Join(e.workDir, "compiled.tfvars")
+		err := CompileWithVariablesTfFromSource(varsFiles, e.srcPath, e.workDir, compiledVarsFile)
+		if err != nil {
+			return fmt.Errorf("failed to compile tfvars: %w", err)
+		}
+		opts = append(opts, tfexec.VarFile(compiledVarsFile))
 	}
 
 	// Run apply
@@ -376,14 +531,21 @@ func (e *Executor) Apply(ctx context.Context, varsFile string) error {
 }
 
 // Destroy runs terraform destroy
-func (e *Executor) Destroy(ctx context.Context, varsFile string) error {
+func (e *Executor) Destroy(ctx context.Context, varsFiles []string) error {
 	if e.tf == nil {
 		return fmt.Errorf("terraform executor not set up")
 	}
 
 	var opts []tfexec.DestroyOption
-	if varsFile != "" {
-		opts = append(opts, tfexec.VarFile(varsFile))
+	
+	// Compile variables if files provided
+	if len(varsFiles) > 0 {
+		compiledVarsFile := filepath.Join(e.workDir, "compiled.tfvars")
+		err := CompileWithVariablesTfFromSource(varsFiles, e.srcPath, e.workDir, compiledVarsFile)
+		if err != nil {
+			return fmt.Errorf("failed to compile tfvars: %w", err)
+		}
+		opts = append(opts, tfexec.VarFile(compiledVarsFile))
 	}
 
 	// Run destroy
@@ -420,6 +582,11 @@ func (e *Executor) SetEnvVar(key, value string) {
 	if e.tf != nil {
 		e.tf.SetEnv(e.envVars)
 	}
+}
+
+// GetWorkDir returns the working directory path
+func (e *Executor) GetWorkDir() string {
+	return e.workDir
 }
 
 // ProviderGenerator interface for creating provider configurations
@@ -464,6 +631,16 @@ provider "aws" {
 type KubernetesProviderGenerator struct{}
 
 func (g *KubernetesProviderGenerator) Generate(writer io.Writer, config map[string]interface{}) error {
+	// Expand tilde in config_path if present
+	if configPath, ok := config["config_path"].(string); ok && strings.HasPrefix(configPath, "~/") {
+		homeDir, err := os.UserHomeDir()
+		if err == nil {
+			expandedPath := filepath.Join(homeDir, configPath[2:])
+			config["config_path"] = expandedPath
+			fmt.Printf("[DEBUG] Expanded kubeconfig path from %s to %s\n", configPath, expandedPath)
+		}
+	}
+	
 	tmpl, err := template.New("kubernetes_provider").Parse(`
 provider "kubernetes" {
   {{- if .config_path }}
@@ -495,6 +672,18 @@ EOT
 type HelmProviderGenerator struct{}
 
 func (g *HelmProviderGenerator) Generate(writer io.Writer, config map[string]interface{}) error {
+	// Expand tilde in kubernetes.config_path if present
+	if kubernetesConfig, ok := config["kubernetes"].(map[string]interface{}); ok {
+		if configPath, ok := kubernetesConfig["config_path"].(string); ok && strings.HasPrefix(configPath, "~/") {
+			homeDir, err := os.UserHomeDir()
+			if err == nil {
+				expandedPath := filepath.Join(homeDir, configPath[2:])
+				kubernetesConfig["config_path"] = expandedPath
+				fmt.Printf("[DEBUG] Expanded helm kubeconfig path from %s to %s\n", configPath, expandedPath)
+			}
+		}
+	}
+	
 	tmpl, err := template.New("helm_provider").Parse(`
 provider "helm" {
   {{- if .kubernetes }}

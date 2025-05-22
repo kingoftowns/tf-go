@@ -6,8 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/kingoftowns/tf-go/internal/config"
+	"github.com/kingoftowns/tf-go/internal/constants"
 	"github.com/kingoftowns/tf-go/internal/terraform"
 	"github.com/kingoftowns/tf-go/internal/vault"
 )
@@ -18,11 +20,11 @@ func main() {
 	defaultPath := os.Getenv("TF_PATH")
 	defaultEnv := os.Getenv("TF_ENV")
 	if defaultEnv == "" {
-		defaultEnv = "dev-devops"
+		defaultEnv = constants.DefaultEnvironment
 	}
 	defaultAction := os.Getenv("TF_ACTION")
 	if defaultAction == "" {
-		defaultAction = "plan"
+		defaultAction = constants.DefaultTerraformAction
 	}
 	defaultVaultAddr := os.Getenv("VAULT_ADDR")
 
@@ -60,18 +62,44 @@ func main() {
 		os.Exit(1)
 	}
 
-	var terraformPath, varsFilePath string
+	var terraformPath string
+	var varsFilePaths []string
 
-	if pathFlag != "" {
+	fmt.Printf("[DEBUG] pathFlag: %s, stackFlag: %s, TF_PATH: %s\n", pathFlag, stackFlag, os.Getenv("TF_PATH"))
+
+	if stackFlag != "" {
+		// Stack takes priority over path flag
+		// Resolve stack path relative to TF_PATH
+		basePath := os.Getenv("TF_PATH")
+		if basePath == "" {
+			basePath = "."
+		}
+
+		// Use the stack path directly - this points to app/stacks/{stack}
+		stackPath := cfg.ResolveStackPath(stackFlag)
+		terraformPath = filepath.Join(basePath, stackPath)
+		fmt.Printf("Using stack path: %s\n", terraformPath)
+		fmt.Printf("[DEBUG] basePath: %s, stackPath: %s, stackFlag: %s\n", basePath, stackPath, stackFlag)
+	} else if pathFlag != "" {
 		terraformPath = pathFlag
+		fmt.Printf("[DEBUG] Using pathFlag: %s\n", terraformPath)
 	} else {
-		terraformPath = cfg.ResolveStackPath(stackFlag)
+		terraformPath = os.Getenv("TF_PATH")
+		if terraformPath == "" {
+			terraformPath = "."
+		}
+		fmt.Printf("[DEBUG] Using TF_PATH fallback: %s\n", terraformPath)
 	}
 
 	if varsFileFlag != "" {
-		varsFilePath = varsFileFlag
-	} else if stackFlag != "" {
-		varsFilePath = cfg.ResolveVarsPath(envFlag, stackFlag)
+		varsFilePaths = []string{varsFileFlag}
+	} else {
+		// For tfvars resolution, always use the base TF_PATH, not the stack-specific path
+		baseTerraformPath := os.Getenv("TF_PATH")
+		if baseTerraformPath == "" {
+			baseTerraformPath = "."
+		}
+		varsFilePaths = cfg.ResolveVarsPath(envFlag, stackFlag, baseTerraformPath)
 	}
 
 	if _, err := os.Stat(terraformPath); os.IsNotExist(err) {
@@ -79,7 +107,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if varsFilePath != "" {
+	for _, varsFilePath := range varsFilePaths {
 		if _, err := os.Stat(varsFilePath); os.IsNotExist(err) {
 			fmt.Printf("Error: Vars file does not exist: %s\n", varsFilePath)
 			os.Exit(1)
@@ -112,6 +140,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Set AWS_PROFILE from provider config for S3 backend
+	if awsConfig, ok := providerConfig["aws"].(map[string]interface{}); ok {
+		if profile, ok := awsConfig["profile"].(string); ok && profile != "" {
+			os.Setenv("AWS_PROFILE", profile)
+			fmt.Printf("Set AWS_PROFILE to: %s\n", profile)
+		}
+	}
+
 	fmt.Println("Setting up Terraform workspace...")
 	executor, err := terraform.NewExecutor(ctx)
 	if err != nil {
@@ -120,25 +156,30 @@ func main() {
 	}
 	defer executor.Clean()
 
-	var backendConfig *terraform.S3BackendConfig
+	// Always use S3 backend (equivalent to backend.rb logic)
+	s3Config := terraform.S3BackendConfig{}
 
+	// Check if environment config overrides S3 settings
 	if envConfig, ok := cfg.Environments[envFlag]; ok && envConfig.Backend.Type == "s3" {
-		s3Config := terraform.S3BackendConfig{
-			Bucket:  fmt.Sprintf("%v", envConfig.Backend.Config["bucket"]),
-			Key:     fmt.Sprintf("%v", envConfig.Backend.Config["key"]),
-			Region:  fmt.Sprintf("%v", envConfig.Backend.Config["region"]),
-			Encrypt: true,
+		if bucket, ok := envConfig.Backend.Config["bucket"]; ok {
+			s3Config.Bucket = fmt.Sprintf("%v", bucket)
 		}
-
+		if key, ok := envConfig.Backend.Config["key"]; ok {
+			s3Config.Key = fmt.Sprintf("%v", key)
+		}
+		if region, ok := envConfig.Backend.Config["region"]; ok {
+			s3Config.Region = fmt.Sprintf("%v", region)
+		}
 		if dynamo, ok := envConfig.Backend.Config["dynamodb_table"]; ok {
 			s3Config.DynamoDBTable = fmt.Sprintf("%v", dynamo)
 		}
-
-		s3Config = terraform.ResolveS3BackendConfig(ctx, s3Config, envFlag, stackFlag)
-		backendConfig = &s3Config
-
-		fmt.Printf("Using S3 backend: %s/%s in %s\n", s3Config.Bucket, s3Config.Key, s3Config.Region)
 	}
+
+	// Apply backend.rb equivalent defaults and resolve placeholders
+	s3Config = terraform.ResolveS3BackendConfig(ctx, s3Config, envFlag, stackFlag)
+	backendConfig := &s3Config
+
+	fmt.Printf("Using S3 backend: %s/%s in %s\n", s3Config.Bucket, s3Config.Key, s3Config.Region)
 
 	err = executor.Setup(ctx, terraformPath, providerConfig, backendConfig)
 	if err != nil {
@@ -156,7 +197,8 @@ func main() {
 	fmt.Printf("Executing Terraform %s...\n", actionFlag)
 	switch actionFlag {
 	case "plan":
-		plan, err := executor.Plan(ctx, varsFilePath)
+		fmt.Println("Generating Terraform plan...")
+		plan, err := executor.Plan(ctx, varsFilePaths)
 		if err != nil {
 			fmt.Printf("Error running Terraform plan: %v\n", err)
 			os.Exit(1)
@@ -164,23 +206,52 @@ func main() {
 
 		if plan.ResourceChanges != nil {
 			var toAdd, toChange, toDestroy int
+			var addResources, changeResources, destroyResources []string
+
 			for _, rc := range plan.ResourceChanges {
 				if rc.Change != nil {
 					action := rc.Change.Actions
+					resource := fmt.Sprintf("%s (%s)", rc.Address, rc.Type)
+
 					if action.Create() {
 						toAdd++
+						addResources = append(addResources, resource)
 					} else if action.Update() {
 						toChange++
+						changeResources = append(changeResources, resource)
 					} else if action.Delete() {
 						toDestroy++
+						destroyResources = append(destroyResources, resource)
 					}
 				}
 			}
-			fmt.Printf("Plan: %d to add, %d to change, %d to destroy.\n", toAdd, toChange, toDestroy)
+
+			fmt.Printf("\nPlan: %d to add, %d to change, %d to destroy.\n", toAdd, toChange, toDestroy)
+
+			if toAdd > 0 {
+				fmt.Println("\nResources to add:")
+				for _, r := range addResources {
+					fmt.Printf("  + %s\n", r)
+				}
+			}
+
+			if toChange > 0 {
+				fmt.Println("\nResources to change:")
+				for _, r := range changeResources {
+					fmt.Printf("  ~ %s\n", r)
+				}
+			}
+
+			if toDestroy > 0 {
+				fmt.Println("\nResources to destroy:")
+				for _, r := range destroyResources {
+					fmt.Printf("  - %s\n", r)
+				}
+			}
 		}
 
 	case "apply":
-		err = executor.Apply(ctx, varsFilePath)
+		err = executor.Apply(ctx, varsFilePaths)
 		if err != nil {
 			fmt.Printf("Error running Terraform apply: %v\n", err)
 			os.Exit(1)
@@ -198,7 +269,7 @@ func main() {
 		}
 
 	case "destroy":
-		err = executor.Destroy(ctx, varsFilePath)
+		err = executor.Destroy(ctx, varsFilePaths)
 		if err != nil {
 			fmt.Printf("Error running Terraform destroy: %v\n", err)
 			os.Exit(1)
