@@ -392,7 +392,7 @@ func (e *Executor) Init(ctx context.Context) error {
 }
 
 // Plan runs terraform plan
-func (e *Executor) Plan(ctx context.Context, varsFiles []string) (*tfjson.Plan, error) {
+func (e *Executor) Plan(ctx context.Context, varsFiles []string, cliVars []string) (*tfjson.Plan, error) {
 	if e.tf == nil {
 		return nil, fmt.Errorf("terraform executor not set up")
 	}
@@ -405,10 +405,10 @@ func (e *Executor) Plan(ctx context.Context, varsFiles []string) (*tfjson.Plan, 
 	var opts []tfexec.PlanOption
 	compiledVarsFile := filepath.Join(e.workDir, "compiled.tfvars")
 	
-	if len(varsFiles) > 0 {
-		fmt.Printf("[DEBUG] Compiling %d tfvars files with variables.tf defaults\n", len(varsFiles))
+	if len(varsFiles) > 0 || len(cliVars) > 0 {
+		fmt.Printf("[DEBUG] Compiling %d tfvars files and %d CLI vars with variables.tf defaults\n", len(varsFiles), len(cliVars))
 		// Pass both source path and work dir so we can find variables.tf in source and write to work dir
-		err := CompileWithVariablesTfFromSource(varsFiles, e.srcPath, e.workDir, compiledVarsFile)
+		err := CompileWithVariablesTfFromSourceAndCLI(varsFiles, cliVars, e.srcPath, e.workDir, compiledVarsFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to compile tfvars: %w", err)
 		}
@@ -519,7 +519,7 @@ func (e *Executor) Plan(ctx context.Context, varsFiles []string) (*tfjson.Plan, 
 }
 
 // Apply runs terraform apply
-func (e *Executor) Apply(ctx context.Context, varsFiles []string) error {
+func (e *Executor) Apply(ctx context.Context, varsFiles []string, cliVars []string) error {
 	if e.tf == nil {
 		return fmt.Errorf("terraform executor not set up")
 	}
@@ -527,9 +527,9 @@ func (e *Executor) Apply(ctx context.Context, varsFiles []string) error {
 	var opts []tfexec.ApplyOption
 	
 	// Compile variables if files provided
-	if len(varsFiles) > 0 {
+	if len(varsFiles) > 0 || len(cliVars) > 0 {
 		compiledVarsFile := filepath.Join(e.workDir, "compiled.tfvars")
-		err := CompileWithVariablesTfFromSource(varsFiles, e.srcPath, e.workDir, compiledVarsFile)
+		err := CompileWithVariablesTfFromSourceAndCLI(varsFiles, cliVars, e.srcPath, e.workDir, compiledVarsFile)
 		if err != nil {
 			return fmt.Errorf("failed to compile tfvars: %w", err)
 		}
@@ -541,7 +541,7 @@ func (e *Executor) Apply(ctx context.Context, varsFiles []string) error {
 }
 
 // Destroy runs terraform destroy
-func (e *Executor) Destroy(ctx context.Context, varsFiles []string) error {
+func (e *Executor) Destroy(ctx context.Context, varsFiles []string, cliVars []string) error {
 	if e.tf == nil {
 		return fmt.Errorf("terraform executor not set up")
 	}
@@ -549,9 +549,9 @@ func (e *Executor) Destroy(ctx context.Context, varsFiles []string) error {
 	var opts []tfexec.DestroyOption
 	
 	// Compile variables if files provided
-	if len(varsFiles) > 0 {
+	if len(varsFiles) > 0 || len(cliVars) > 0 {
 		compiledVarsFile := filepath.Join(e.workDir, "compiled.tfvars")
-		err := CompileWithVariablesTfFromSource(varsFiles, e.srcPath, e.workDir, compiledVarsFile)
+		err := CompileWithVariablesTfFromSourceAndCLI(varsFiles, cliVars, e.srcPath, e.workDir, compiledVarsFile)
 		if err != nil {
 			return fmt.Errorf("failed to compile tfvars: %w", err)
 		}

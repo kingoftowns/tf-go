@@ -898,3 +898,231 @@ func findAllVariablesTfFiles(dir string) []string {
 	
 	return results
 }
+
+// parseCliVariable parses a CLI variable in the format key=value
+func parseCliVariable(cliVar string) (string, interface{}, error) {
+	parts := strings.SplitN(cliVar, "=", 2)
+	if len(parts) != 2 {
+		return "", nil, fmt.Errorf("invalid variable format: %s (expected key=value)", cliVar)
+	}
+	
+	key := strings.TrimSpace(parts[0])
+	value := strings.TrimSpace(parts[1])
+	
+	// Try to parse the value as different types
+	// First check if it's a boolean
+	if value == "true" || value == "false" {
+		return key, value == "true", nil
+	}
+	
+	// Check if it's a number
+	if numberRegex := regexp.MustCompile(`^-?\d+(\.\d+)?$`); numberRegex.MatchString(value) {
+		if strings.Contains(value, ".") {
+			if floatVal, err := strconv.ParseFloat(value, 64); err == nil {
+				return key, floatVal, nil
+			}
+		} else {
+			if intVal, err := strconv.ParseInt(value, 10, 64); err == nil {
+				return key, intVal, nil
+			}
+		}
+	}
+	
+	// Check if it's a JSON object (for maps)
+	if strings.HasPrefix(value, "{") && strings.HasSuffix(value, "}") {
+		// Simple JSON-like map parsing
+		mapValue := make(map[string]interface{})
+		// Remove braces and split by comma
+		content := strings.TrimSpace(value[1 : len(value)-1])
+		if content != "" {
+			pairs := strings.Split(content, ",")
+			for _, pair := range pairs {
+				kvParts := strings.SplitN(pair, ":", 2)
+				if len(kvParts) == 2 {
+					k := strings.Trim(strings.TrimSpace(kvParts[0]), "\"")
+					v := strings.Trim(strings.TrimSpace(kvParts[1]), "\"")
+					mapValue[k] = v
+				}
+			}
+		}
+		return key, mapValue, nil
+	}
+	
+	// Check if it's a JSON array (for lists)
+	if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+		// Simple JSON-like array parsing
+		var listValue []interface{}
+		// Remove brackets and split by comma
+		content := strings.TrimSpace(value[1 : len(value)-1])
+		if content != "" {
+			items := strings.Split(content, ",")
+			for _, item := range items {
+				trimmedItem := strings.Trim(strings.TrimSpace(item), "\"")
+				listValue = append(listValue, trimmedItem)
+			}
+		}
+		return key, listValue, nil
+	}
+	
+	// Default to string
+	return key, value, nil
+}
+
+// CompileWithVariablesTfFromSourceAndCLI compiles tfvars files, merges with variables.tf defaults, and includes CLI variables
+func CompileWithVariablesTfFromSourceAndCLI(tfvarsFiles []string, cliVars []string, srcDir string, workDir string, outputPath string) error {
+	compiler := NewVariableCompiler()
+	
+	// First, handle variables.tf defaults (same as before)
+	isStackPath := strings.Contains(srcDir, "/app/stacks/")
+	fmt.Printf("[DEBUG] srcDir: %s, isStackPath: %v\n", srcDir, isStackPath)
+	
+	if isStackPath {
+		// For stack-specific path, look for variables.tf in the same directory
+		variablesTfPath := filepath.Join(srcDir, "variables.tf")
+		fmt.Printf("[DEBUG] Looking for stack variables.tf at: %s\n", variablesTfPath)
+		
+		if _, err := os.Stat(variablesTfPath); err == nil {
+			fmt.Printf("[DEBUG] Found stack-specific variables.tf\n")
+			defaults, err := compiler.parseVariablesTf(variablesTfPath)
+			if err != nil {
+				fmt.Printf("[WARNING] Failed to parse variables.tf: %v\n", err)
+			} else {
+				// Add defaults to compiler
+				fmt.Printf("[DEBUG] Found %d default variables in variables.tf\n", len(defaults))
+				for name, variable := range defaults {
+					compiler.variables[name] = variable
+					if mapVal, ok := variable.Value.(map[string]interface{}); ok {
+						fmt.Printf("[DEBUG] Added stack default map for variable '%s' with %d fields:\n", name, len(mapVal))
+						for k, v := range mapVal {
+							fmt.Printf("[DEBUG]   %s.%s = %v (%T)\n", name, k, v, v)
+						}
+					} else {
+						fmt.Printf("[DEBUG] Added stack default for variable '%s': %v (%T)\n", name, variable.Value, variable.Value)
+					}
+				}
+			}
+		} else {
+			fmt.Printf("[DEBUG] No variables.tf found at stack path: %s\n", variablesTfPath)
+		}
+	} else {
+		// For non-stack paths, find all variables.tf files recursively and compile from all of them
+		fmt.Printf("[DEBUG] Non-stack path detected, searching for all variables.tf files recursively\n")
+		
+		// Find TF_PATH root (go up until we find a directory that might contain app/stacks)
+		tfPath := findTfPathRoot(srcDir)
+		fmt.Printf("[DEBUG] Using TF_PATH root: %s\n", tfPath)
+		
+		variablesTfPaths := findAllVariablesTfFiles(tfPath)
+		fmt.Printf("[DEBUG] Found %d variables.tf files\n", len(variablesTfPaths))
+		
+		for _, path := range variablesTfPaths {
+			fmt.Printf("[DEBUG] Processing variables.tf: %s\n", path)
+			defaults, err := compiler.parseVariablesTf(path)
+			if err != nil {
+				fmt.Printf("[WARNING] Failed to parse %s: %v\n", path, err)
+				continue
+			}
+			
+			// Merge defaults from this file
+			for name, variable := range defaults {
+				if existing, exists := compiler.variables[name]; exists {
+					// If both are maps, merge them
+					if existingMap, ok := existing.Value.(map[string]interface{}); ok {
+						if newMap, ok := variable.Value.(map[string]interface{}); ok {
+							mergedMap := make(map[string]interface{})
+							for k, v := range existingMap {
+								mergedMap[k] = v
+							}
+							for k, v := range newMap {
+								mergedMap[k] = v
+							}
+							compiler.variables[name] = TerraformVariable{
+								Name:  name,
+								Value: mergedMap,
+								Type:  "map",
+							}
+							fmt.Printf("[DEBUG] Merged variable '%s' from %s\n", name, path)
+							continue
+						}
+					}
+					fmt.Printf("[DEBUG] Overriding variable '%s' from %s\n", name, path)
+				} else {
+					fmt.Printf("[DEBUG] Added variable '%s' from %s\n", name, path)
+				}
+				compiler.variables[name] = variable
+			}
+		}
+	}
+	
+	// Then compile tfvars files (these will override defaults)
+	fmt.Printf("[DEBUG] Before compiling tfvars, compiler has %d variables\n", len(compiler.variables))
+	for name, variable := range compiler.variables {
+		if mapVal, ok := variable.Value.(map[string]interface{}); ok {
+			fmt.Printf("[DEBUG] Pre-compile variable '%s' has %d map fields\n", name, len(mapVal))
+		} else {
+			fmt.Printf("[DEBUG] Pre-compile variable '%s': %v\n", name, variable.Value)
+		}
+	}
+	
+	compiledContent, err := compiler.CompileVariables(tfvarsFiles)
+	if err != nil {
+		return fmt.Errorf("failed to compile variables: %w", err)
+	}
+	
+	// Finally, apply CLI variables (these have highest priority)
+	if len(cliVars) > 0 {
+		fmt.Printf("[DEBUG] Processing %d CLI variables\n", len(cliVars))
+		for _, cliVar := range cliVars {
+			key, value, err := parseCliVariable(cliVar)
+			if err != nil {
+				return fmt.Errorf("failed to parse CLI variable: %w", err)
+			}
+			
+			// Determine the type
+			varType := "string"
+			switch value.(type) {
+			case bool:
+				varType = "bool"
+			case int64, float64:
+				varType = "number"
+			case map[string]interface{}:
+				varType = "map"
+			case []interface{}:
+				varType = "list"
+			}
+			
+			// Check if variable already exists and is a map
+			if existing, exists := compiler.variables[key]; exists && varType == "string" {
+				// If existing is a map and CLI provides a dot-notation key, update the map field
+				if existingMap, ok := existing.Value.(map[string]interface{}); ok && strings.Contains(key, ".") {
+					parts := strings.SplitN(key, ".", 2)
+					if len(parts) == 2 {
+						existingMap[parts[1]] = value
+						fmt.Printf("[DEBUG] Updated map field '%s.%s' = %v from CLI\n", parts[0], parts[1], value)
+						continue
+					}
+				}
+			}
+			
+			compiler.variables[key] = TerraformVariable{
+				Name:  key,
+				Value: value,
+				Type:  varType,
+			}
+			fmt.Printf("[DEBUG] Set CLI variable '%s' = %v (%s)\n", key, value, varType)
+		}
+		
+		// Regenerate compiled content with CLI variables included
+		compiledContent = compiler.generateCompiledTfvars()
+	}
+	
+	fmt.Printf("[DEBUG] Final compiled content:\n%s\n", compiledContent)
+	
+	err = os.WriteFile(outputPath, []byte(compiledContent), 0644)
+	if err != nil {
+		return fmt.Errorf("failed to write compiled tfvars: %w", err)
+	}
+	
+	fmt.Printf("[DEBUG] Compiled tfvars with defaults and CLI vars written to: %s\n", outputPath)
+	return nil
+}

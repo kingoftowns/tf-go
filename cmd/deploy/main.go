@@ -8,12 +8,25 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/kingoftowns/tf-go/internal/config"
 	"github.com/kingoftowns/tf-go/internal/constants"
 	"github.com/kingoftowns/tf-go/internal/terraform"
 	"github.com/kingoftowns/tf-go/internal/vault"
 )
+
+// VarFlags is a custom flag type to collect multiple -var flags
+type VarFlags []string
+
+func (v *VarFlags) String() string {
+	return strings.Join(*v, ", ")
+}
+
+func (v *VarFlags) Set(value string) error {
+	*v = append(*v, value)
+	return nil
+}
 
 func main() {
 	ctx := context.Background()
@@ -37,6 +50,7 @@ func main() {
 		actionFlag    string
 		vaultAddrFlag string
 		saveWorkspace string
+		varsFlag      VarFlags
 	)
 
 	flag.StringVar(&pathFlag, "path", defaultPath, "Path to Terraform code")
@@ -50,6 +64,7 @@ func main() {
 	flag.StringVar(&actionFlag, "action", defaultAction, "Terraform action (plan, apply, destroy)")
 	flag.StringVar(&vaultAddrFlag, "vault-addr", defaultVaultAddr, "Vault server address")
 	flag.StringVar(&saveWorkspace, "save-workspace", "", "Save terraform workspace to this directory path")
+	flag.Var(&varsFlag, "var", "Set a variable in the Terraform configuration (can be used multiple times)")
 
 	flag.Parse()
 
@@ -201,7 +216,7 @@ func main() {
 	switch actionFlag {
 	case "plan":
 		fmt.Println("Generating Terraform plan...")
-		plan, err := executor.Plan(ctx, varsFilePaths)
+		plan, err := executor.Plan(ctx, varsFilePaths, varsFlag)
 		if err != nil {
 			fmt.Printf("Error running Terraform plan: %v\n", err)
 			os.Exit(1)
@@ -299,7 +314,7 @@ func main() {
 		}
 
 	case "apply":
-		err = executor.Apply(ctx, varsFilePaths)
+		err = executor.Apply(ctx, varsFilePaths, varsFlag)
 		if err != nil {
 			fmt.Printf("Error running Terraform apply: %v\n", err)
 			os.Exit(1)
@@ -317,7 +332,7 @@ func main() {
 		}
 
 	case "destroy":
-		err = executor.Destroy(ctx, varsFilePaths)
+		err = executor.Destroy(ctx, varsFilePaths, varsFlag)
 		if err != nil {
 			fmt.Printf("Error running Terraform destroy: %v\n", err)
 			os.Exit(1)

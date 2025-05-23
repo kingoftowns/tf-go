@@ -23,3 +23,8 @@ go.work.sum
 
 # env file
 .env
+
+# Compiled binaries
+deploy
+debug
+tf-go
